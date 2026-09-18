@@ -116,7 +116,9 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                     "deleteKey pre-hook: uid=$callingUid alias=${keyDescriptor?.alias} domain=${keyDescriptor?.domain}"
                 )
                 if (keyDescriptor != null) {
-                    val alias = keyDescriptor.alias
+                    val alias =
+                        keyDescriptor.alias
+                            ?: SecurityLevelInterceptor.findAliasForNspace(callingUid, keyDescriptor.nspace)
                     if (alias != null) {
                         val key = SecurityLevelInterceptor.Key(callingUid, alias)
                         val isSoftware =

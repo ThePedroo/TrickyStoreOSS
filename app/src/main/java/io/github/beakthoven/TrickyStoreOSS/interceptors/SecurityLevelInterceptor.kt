@@ -45,7 +45,12 @@ private const val MAX_ATTESTATION_CHALLENGE_BYTES = 128
 class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, private val level: Int) :
     BinderInterceptor() {
     override val interceptedCodes: IntArray by lazy {
-        intArrayOf(generateKeyTransaction, createOperationTransaction, importKeyTransaction)
+        intArrayOf(
+            generateKeyTransaction,
+            createOperationTransaction,
+            importKeyTransaction,
+            importWrappedKeyTransaction,
+        )
             .filter { it >= 0 }
             .toIntArray()
     }
@@ -61,6 +66,8 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
         private val createOperationTransaction =
             getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "createOperation")
         private val importKeyTransaction = getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "importKey")
+        private val importWrappedKeyTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "importWrappedKey")
 
         private val secureRandom = SecureRandom()
 
@@ -135,17 +142,31 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
 
         @Keep val usageRemaining = ConcurrentHashMap<Key, Int>()
 
+        // Single invalidation point for an alias: drops both nspace indices
+        // plus all per-alias state across forged/patched modes. Snapshots the
+        // indices before clearing (fail-closed: callers insert after), and
+        // leaves persistence to the caller — cleanupKey deletes, regen paths
+        // overwrite via saveKey / fresh patched responses.
         @Keep
-        fun cleanupKey(uid: Int, alias: String) {
+        fun invalidateAliasState(uid: Int, alias: String) {
             val k = Key(uid, alias)
-            keys[k]?.response?.metadata?.key?.nspace?.let { keysByNspace.remove(it) }
+            val forgedNspace = keys[k]?.response?.metadata?.key?.nspace
+            val patchedNspace = patchedResponses[k]?.metadata?.key?.nspace
+            if (forgedNspace != null && forgedNspace != 0L) keysByNspace.remove(forgedNspace)
+            if (patchedNspace != null && patchedNspace != 0L && patchedNspace != forgedNspace)
+                keysByNspace.remove(patchedNspace)
             keys.remove(k)
             keyPairs.remove(k)
             skipLeafHacks.remove(k)
             patchedResponses.remove(k)
             usageRemaining.remove(k)
-            grants.values.removeIf { it.key == k }
+            grants.entries.removeIf { it.value.key == k }
             CertificateHack.leafAlgorithms.remove(CertificateHack.KeyIdentifier(alias, uid))
+        }
+
+        @Keep
+        fun cleanupKey(uid: Int, alias: String) {
+            invalidateAliasState(uid, alias)
             PersistenceManager.deleteKey(uid, alias)
         }
 
@@ -181,7 +202,7 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
         callingPid: Int,
         data: Parcel,
     ): Result {
-        if (code == importKeyTransaction) {
+        if (code == importKeyTransaction || code == importWrappedKeyTransaction) {
             return if (PkgConfig.needHack(callingUid) || PkgConfig.needGenerate(callingUid)) Continue else Skip
         }
         if (code == generateKeyTransaction) {
@@ -373,9 +394,11 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
                         this.metadata = metadata
                         iSecurityLevel = original
                     }
-                patchedResponses[Key(callingUid, keyDescriptor.alias)] = response
+                val regenKey = Key(callingUid, keyDescriptor.alias)
+                invalidateAliasState(callingUid, keyDescriptor.alias)
+                patchedResponses[regenKey] = response
                 metadata.key?.nspace?.let { nspace ->
-                    if (nspace != 0L) keysByNspace[nspace] = Key(callingUid, keyDescriptor.alias)
+                    if (nspace != 0L) keysByNspace[nspace] = regenKey
                 }
                 Logger.i("Patched generateKey chain for uid=$callingUid alias=${keyDescriptor.alias}")
                 typedReply(metadata)
@@ -383,7 +406,10 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
             val result = raw.onFailure { Logger.e("patch generateKey reply", it) }.getOrNull()
             if (result != null) return result
         }
-        if (code == importKeyTransaction && reply != null && !reply.hasException()) {
+        if (
+            (code == importKeyTransaction || code == importWrappedKeyTransaction) && reply != null &&
+                !reply.hasException()
+        ) {
             val raw = runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return@runCatching
@@ -407,9 +433,10 @@ class SecurityLevelInterceptor(private val original: IKeystoreSecurityLevel, pri
         skipLeafHack: Boolean,
         startNanos: Long,
     ): Result {
-        keyDescriptor.nspace = secureRandom.nextLong()
         val key = Key(callingUid, keyDescriptor.alias)
-        keysByNspace[keyDescriptor.nspace] = key
+        invalidateAliasState(callingUid, keyDescriptor.alias)
+        keyDescriptor.nspace = secureRandom.nextLong()
+        if (keyDescriptor.nspace != 0L) keysByNspace[keyDescriptor.nspace] = key
         if (keyPair != null && chain != null) keyPairs[key] = Pair(keyPair, chain)
         val response = buildResponse(chain, kgp, keyDescriptor, callingUid)
         keys[key] = Info(keyPair, secretKey, response, kgp)
