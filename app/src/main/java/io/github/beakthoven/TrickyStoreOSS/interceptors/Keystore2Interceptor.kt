@@ -41,6 +41,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
     private val updateSubcomponentTransaction = transactCode("updateSubcomponent")
     private val listEntriesTransaction = transactCode("listEntries")
     private val listEntriesBatchedTransaction = transactCode("listEntriesBatched")
+    private val getNumberOfEntriesTransaction = transactCode("getNumberOfEntries")
     private val grantTransaction = transactCode("grant")
     private val ungrantTransaction = transactCode("ungrant")
     private val domainGrant: Int =
@@ -58,6 +59,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 updateSubcomponentTransaction,
                 listEntriesTransaction,
                 listEntriesBatchedTransaction,
+                getNumberOfEntriesTransaction,
                 grantTransaction,
                 ungrantTransaction,
             )
@@ -335,8 +337,13 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         if (
             listEntriesTransaction >= 0 &&
                 (code == listEntriesTransaction || code == listEntriesBatchedTransaction) &&
-                KeyBoxUtils.hasKeyboxes() &&
-                (PkgConfig.needGenerate(callingUid) || PkgConfig.needHack(callingUid))
+                shouldAccountForgedKeys(callingUid)
+        ) {
+            return Continue
+        }
+        if (
+            code == getNumberOfEntriesTransaction && getNumberOfEntriesTransaction >= 0 &&
+                shouldAccountForgedKeys(callingUid)
         ) {
             return Continue
         }
@@ -388,6 +395,44 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         return raw.onFailure { Logger.e("listEntries merge failed uid=$callingUid", it) }.getOrNull() ?: Skip
     }
 
+    // Single predicate shared by the list/count oracles so they cannot drift
+    // apart: forged entries are counted/listed exactly for these callers.
+    // Post-hooks don't re-check it: native fires post only after pre
+    // returned Continue (binder_interceptor.cpp), so post implies gate-true.
+    private fun shouldAccountForgedKeys(callingUid: Int): Boolean =
+        KeyBoxUtils.hasKeyboxes() && (PkgConfig.needGenerate(callingUid) || PkgConfig.needHack(callingUid))
+
+    // Forged keys live only in SecurityLevelInterceptor.keys, which the real
+    // COUNT(alias)...state=Live query cannot see. Keep the scalar ledger
+    // consistent with the merged listEntries view. Over-count on real+forged
+    // alias collision is rare (same uid/alias in both stores) and degrades to
+    // real+forged vs list dedupe; fixing it would require a re-entrant list
+    // query in the post-hook and is intentionally avoided for minimality.
+    private fun adjustEntryCount(callingUid: Int, data: Parcel, reply: Parcel, resultCode: Int): Result {
+        val raw = runCatching {
+            if (resultCode != 0) return@runCatching Skip
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            if (data.dataAvail() < 4) return@runCatching Skip
+            if (data.readInt() != 0) return@runCatching Skip
+            // nspace is forced to callingUid for Domain.APP by the daemon
+            // (service.rs:get_key_descriptor_for_lookup); consume for
+            // parcel-correctness but don't branch — matches mergeListEntries
+            // which reads and discards it. Non-APP domains already Skip'd.
+            if (data.dataAvail() >= 8) data.readLong()
+            if (reply.hasException()) return@runCatching Skip
+            if (reply.dataAvail() < 4) return@runCatching Skip
+            val real = reply.readInt()
+            val forged = SecurityLevelInterceptor.keys.keys.count { it.uid == callingUid }
+            if (forged == 0) return@runCatching Skip
+            val p = Parcel.obtain()
+            p.writeNoException()
+            p.writeInt(real + forged)
+            Logger.d("getNumberOfEntries: adjusted $real + $forged forged for uid=$callingUid")
+            OverrideReply(0, p)
+        }
+        return raw.onFailure { Logger.e("getNumberOfEntries adjust failed uid=$callingUid", it) }.getOrNull() ?: Skip
+    }
+
     override fun onPostTransact(
         target: IBinder,
         code: Int,
@@ -402,11 +447,13 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
 
         if (
             listEntriesTransaction >= 0 &&
-                (code == listEntriesTransaction || code == listEntriesBatchedTransaction) &&
-                KeyBoxUtils.hasKeyboxes() &&
-                (PkgConfig.needGenerate(callingUid) || PkgConfig.needHack(callingUid))
+                (code == listEntriesTransaction || code == listEntriesBatchedTransaction)
         ) {
             return mergeListEntries(callingUid, code, data, reply, resultCode)
+        }
+
+        if (code == getNumberOfEntriesTransaction && getNumberOfEntriesTransaction >= 0) {
+            return adjustEntryCount(callingUid, data, reply, resultCode)
         }
 
         if (code == deleteKeyTransaction && resultCode == 0) {
